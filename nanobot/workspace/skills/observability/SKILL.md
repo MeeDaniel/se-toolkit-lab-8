@@ -11,6 +11,23 @@ You have access to VictoriaLogs for querying structured logs and error counts.
 
 ## When to Use These Tools
 
+### User asks "What went wrong?" or "Check system health"
+
+This is a **multi-step investigation**. Follow this flow:
+
+1. **Check for recent errors** — Call `logs_error_count` with `hours=1` (or last 15 minutes if specified)
+2. **If errors found** — Call `logs_search` with query for recent errors to get details
+3. **Extract trace ID** — From the error logs, find any `trace_id` field
+4. **Fetch trace details** — If you have trace tools available, fetch the full trace
+5. **Summarize findings** — Present a coherent investigation summary:
+   - What failed (endpoint, operation)
+   - Root cause (error message, exception type)
+   - When it happened
+   - Affected service
+   - Trace ID for debugging
+
+**Do NOT dump raw JSON.** Synthesize the information into a clear narrative.
+
 ### User asks about errors or issues
 If the user asks "Any errors?", "What's broken?", "Show me errors", or similar:
 1. Call `logs_error_count` with `hours=1` (or the specified time window)

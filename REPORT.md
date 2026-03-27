@@ -299,15 +299,179 @@ Error details:
 
 ## Task 4A — Multi-step investigation
 
-<!-- Paste the agent's response to "What went wrong?" showing chained log + trace investigation -->
+**With PostgreSQL stopped, asked: "What went wrong?"**
+
+```
+🔍 System Failure Investigation
+
+Summary
+
+What went wrong: The LMS backend failed to connect to PostgreSQL database 
+twice in the last 2 hours, causing the ETL pipeline sync to crash.
+
+📊 Error Overview
+
+ Metric                  Value
+ ────────────────────────────────────────────────────────────────────────────
+ Total Errors (2 hours)  2
+ Affected Service        Learning Management Service
+ Error Type              socket.gaierror: [Errno -2] Name or service not known
+ Failed Endpoint         POST /pipeline/sync
+ Root Cause              PostgreSQL container unreachable (DNS resolution failure)
+
+📋 Log Evidence
+
+Error 1 — Most Recent
+ Time      2026-03-27T15:34:02
+ Trace ID  36f90cf0946e174d5867001e0c2656c0
+ Event     unhandled_exception
+ Severity  ERROR
+ Path      /pipeline/sync
+
+🔬 Root Cause Analysis
+
+What Happened (Call Chain)
+
+ POST /pipeline/sync
+   └─► app/routers/pipeline.py:19 (post_sync)
+        └─► app/etl.py:230 (sync)
+             └─► app/etl.py:112 (load_items)
+                  └─► session.exec(...)  ← SQLModel/SQLAlchemy
+                       └─► asyncpg.connect()
+                            └─► socket.gaierror: [Errno -2] Name or service not known
+
+Why It Happened
+
+The backend tried to connect to PostgreSQL but DNS resolution failed. This means:
+1. PostgreSQL container was stopped — the service name 'postgres' doesn't resolve
+   when the container isn't running
+2. Or network issue — containers can't reach each other on lms-network
+```
+
+**Investigation flow:**
+1. Agent called `logs_error_count` to find errors in the last 2 hours
+2. Called `logs_search` to get detailed error logs
+3. Extracted trace IDs from error logs
+4. Presented coherent narrative with call chain analysis
 
 ## Task 4B — Proactive health check
 
-<!-- Screenshot or transcript of the proactive health report that appears in the Flutter chat -->
+**Created health check via Flutter chat:**
+
+```
+Q: "Create a health check for this chat that runs every 2 minutes. Each run should 
+check for backend errors in the last 2 minutes, and post a short summary here. If 
+there are no recent errors, say the system looks healthy. Use your cron tool."
+
+A: Created the health check job (ID: cac9855e) that runs every 2 minutes.
+```
+
+**Proactive health report from cron job (while PostgreSQL stopped):**
+
+```
+🐾 **Health Check** (2026-03-27 15:41 UTC)
+
+⚠️ **System UNHEALTHY**
+
+Issues detected in the last 2 minutes:
+- LMS backend returning HTTP 404 errors
+- Database connection failures (PostgreSQL unreachable)
+- ETL pipeline sync failed
+
+Root cause: PostgreSQL container is stopped, causing DNS resolution failure 
+when backend tries to connect.
+
+*Next check in 2 minutes...*
+```
+
+**Nanobot logs showing cron execution:**
+
+```
+2026-03-27 15:41:56.923 | INFO | nanobot.cron.service:_execute_job:248 - Cron: executing job 'Health check: Check backend er' (cac9855e)
+2026-03-27 15:42:29.922 | INFO | nanobot.cron.service:_execute_job:257 - Cron: job 'Health check: Check backend er' completed
+2026-03-27 15:42:29.921 | INFO | nanobot.utils.evaluator:evaluate_response:87 - evaluate_response: should_notify=True, reason=Health check detected actual backend errors (database connection failures) that require attention and action.
+```
+
+**Job removal:**
+
+```
+Q: "Remove the health check job"
+A: [Job cac9855e removed]
+```
 
 ## Task 4C — Bug fix and recovery
 
-<!-- 1. Root cause identified
-     2. Code fix (diff or description)
-     3. Post-fix response to "What went wrong?" showing the real underlying failure
-     4. Healthy follow-up report or transcript after recovery -->
+**1. Root cause — the planted bug:**
+
+File: `backend/app/routers/items.py`, function `get_items()`
+
+The bug was a **catch-all exception handler** that converted ALL exceptions to HTTP 404 "Items not found":
+
+```python
+@router.get("/", response_model=list[ItemRecord])
+async def get_items(session: AsyncSession = Depends(get_session)):
+    """Get all items."""
+    try:
+        return await read_items(session)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Items not found",
+        ) from exc  # ← BUG: Converts database errors to 404
+```
+
+**Problem:** When PostgreSQL was down, database connection errors (socket.gaierror) were being converted to 404 errors, masking the real issue and misleading both users and the agent.
+
+**2. The fix:**
+
+Removed the catch-all exception handler. Let the global exception handler in `main.py` handle errors properly as 500 Internal Server Error:
+
+```python
+@router.get("/", response_model=list[ItemRecord])
+async def get_items(session: AsyncSession = Depends(get_session)):
+    """Get all items."""
+    return await read_items(session)  # ← No try/except, let errors propagate
+```
+
+**3. Post-fix failure check (with PostgreSQL stopped):**
+
+After redeploy, asked "What went wrong?":
+
+```
+🔍 System Failure Investigation
+
+Summary: The LMS backend cannot connect to PostgreSQL. 4 errors in the last 2 hours,
+all caused by database connection failures.
+
+📊 Error Overview
+ Metric                  Value
+ ────────────────────────────────────────────────────
+ Total Errors (2 hours)  4 ⚠️
+ Affected Service        Learning Management Service
+ Error Type              socket.gaierror: [Errno -2] Name or service not known
+ Root Cause              PostgreSQL container unreachable (DNS resolution failure)
+```
+
+The agent now correctly identifies the **real database error** instead of seeing misleading 404s.
+
+**4. Healthy follow-up (after PostgreSQL restarted):**
+
+```
+🏥 System Health Check
+
+Time: 2026-03-27 18:49 MSK
+
+✅ Good News — System Recovered!
+
+ Component      Status          Details
+ ─────────────────────────────────────────────────────
+ LMS Backend    🟢 HEALTHY      Item count: 56
+ PostgreSQL     🟢 Connected    DNS resolution working
+ API Endpoints  🟢 Operational  Responding normally
+
+📊 Error Summary (Last Hour)
+ Metric                 Value
+ ────────────────────────────────────────────────────
+ Total Errors           5 (all historical)
+ New Errors Since Then  ✅ None
+```
