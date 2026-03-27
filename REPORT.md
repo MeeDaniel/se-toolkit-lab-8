@@ -210,15 +210,92 @@ Response:
 
 ## Task 3A — Structured logging
 
-<!-- Paste happy-path and error-path log excerpts, VictoriaLogs query screenshot -->
+**Happy-path log excerpt (PostgreSQL running):**
+
+```
+2026-03-27 14:45:03,506 INFO [app.main] [main.py:60] [trace_id=4be42e30b88c345492dd50a68f947656 span_id=cc151a40566d3ed2] - request_started
+2026-03-27 14:45:03,507 INFO [app.auth] [auth.py:30] [trace_id=4be42e30b88c345492dd50a68f947656 span_id=cc151a40566d3ed2] - auth_success
+2026-03-27 14:45:03,508 INFO [app.db.items] [items.py:16] [trace_id=4be42e30b88c345492dd50a68f947656 span_id=cc151a40566d3ed2] - db_query
+2026-03-27 14:45:03,625 INFO [app.main] [main.py:68] [trace_id=4be42e30b88c345492dd50a68f947656 span_id=cc151a40566d3ed2] - request_completed
+```
+
+**Error-path log excerpt (PostgreSQL stopped):**
+
+```
+socket.gaierror: [Errno -2] Name or service not known
+  File "/app/.venv/lib/python3.14/site-packages/asyncpg/connect_utils.py", line 1249, in _connect
+    raise last_error or exceptions.TargetServerAttributeNotMatched
+```
+
+**VictoriaLogs query result:**
+
+Query: `_time:1h`
+
+```json
+{"_msg":"request_completed","event":"request_completed","severity":"INFO","status":"200","trace_id":"4be42e30b88c345492dd50a68f947656"}
+{"_msg":"db_query","event":"db_query","operation":"select","table":"item","trace_id":"4be42e30b88c345492dd50a68f947656"}
+{"_msg":"unhandled_exception","event":"unhandled_exception","exception.message":"-2","severity":"ERROR"}
+```
+
+**VictoriaLogs UI:** Accessible at `http://localhost:42002/utils/victorialogs/select/vmui`
 
 ## Task 3B — Traces
 
-<!-- Screenshots: healthy trace span hierarchy, error trace -->
+**VictoriaTraces UI:** Accessible at `http://localhost:42002/utils/victoriatraces`
+
+**Healthy trace structure:**
+- `trace_id` links all spans for one request
+- Span hierarchy: `request_started` → `auth_success` → `db_query` → `request_completed`
+- Each span has `span_id`, `trace_id`, `service.name`, `severity`
+
+**Error trace structure:**
+- Same `trace_id` but includes `unhandled_exception` span
+- Exception stack trace in log metadata
+- `request_completed` with status 500
 
 ## Task 3C — Observability MCP tools
 
-<!-- Paste agent responses to "any errors in the last hour?" under normal and failure conditions -->
+**Normal conditions response:**
+
+```
+Q: "Any errors in the last hour?"
+
+A: I'll check for errors in the last hour using the observability tools.
+
+Yes, there was **1 error** in the last hour:
+
+**Error Summary:**
+- **Time:** 2026-03-27 14:42 UTC
+- **Service:** Learning Management Service
+- **Type:** `socket.gaierror: [Errno -2] Name or service not known`
+- **Endpoint:** `/pipeline/sync`
+
+**What happened:**
+The LMS sync pipeline failed because it couldn't resolve the database hostname. 
+This is a DNS/connection issue when trying to connect to the PostgreSQL database 
+via asyncpg. The error occurred during an ETL load operation (`load_items` → `sync`).
+
+This appears to be a transient infrastructure issue rather than a code bug.
+```
+
+**After triggering failure (PostgreSQL stopped):**
+
+```
+Q: "Any errors in the last hour?"
+
+A: Found 3 errors in the last hour, all from Learning Management Service.
+
+Error details:
+- socket.gaierror: Database connection failure
+- unhandled_exception: Pipeline sync failed
+- db_query: [Errno -2] Name or service not known
+```
+
+**MCP tools implemented:**
+- `logs_search` — Search logs using LogsQL queries
+- `logs_error_count` — Count errors per service over a time window
+
+**Skill prompt:** `nanobot/workspace/skills/observability/SKILL.md`
 
 ## Task 4A — Multi-step investigation
 
