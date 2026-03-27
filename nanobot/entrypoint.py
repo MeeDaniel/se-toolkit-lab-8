@@ -58,6 +58,8 @@ def resolve_config() -> str:
                 lms_server["env"]["NANOBOT_LMS_BACKEND_URL"] = backend_url
             if api_key := os.environ.get("NANOBOT_LMS_API_KEY", ""):
                 lms_server["env"]["NANOBOT_LMS_API_KEY"] = api_key
+            if victorialogs_url := os.environ.get("NANOBOT_VICTORIALOGS_URL", ""):
+                lms_server["env"]["NANOBOT_VICTORIALOGS_URL"] = victorialogs_url
 
     # Write resolved config
     with open(resolved_path, "w") as f:

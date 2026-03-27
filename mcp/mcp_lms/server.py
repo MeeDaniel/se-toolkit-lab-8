@@ -1,4 +1,4 @@
-"""Stdio MCP server exposing LMS backend operations as typed tools."""
+"""Stdio MCP server exposing LMS backend and observability operations as typed tools."""
 
 from __future__ import annotations
 
@@ -7,7 +7,9 @@ import json
 import os
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
+from urllib.parse import quote
 
+import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
@@ -18,6 +20,9 @@ from mcp_lms.client import LMSClient
 _base_url: str = ""
 
 server = Server("lms")
+
+# VictoriaLogs base URL (from env var or default)
+_VICTORIALOGS_URL: str = ""
 
 # ---------------------------------------------------------------------------
 # Input models
@@ -35,6 +40,23 @@ class _LabQuery(BaseModel):
 class _TopLearnersQuery(_LabQuery):
     limit: int = Field(
         default=5, ge=1, description="Max learners to return (default 5)."
+    )
+
+
+class _LogsSearchQuery(BaseModel):
+    query: str = Field(
+        default="*",
+        description="LogsQL query (e.g., 'error', 'service.name=\"backend\"').",
+    )
+    limit: int = Field(default=20, ge=1, le=100, description="Max logs to return.")
+
+
+class _LogsErrorCountQuery(BaseModel):
+    service: str = Field(
+        default="", description="Filter by service name (empty = all services)."
+    )
+    hours: int = Field(
+        default=1, ge=1, le=168, description="Time window in hours (max 7 days)."
     )
 
 
@@ -113,6 +135,77 @@ async def _sync_pipeline(_args: _NoArgs) -> list[TextContent]:
 
 
 # ---------------------------------------------------------------------------
+# Observability tool handlers (VictoriaLogs)
+# ---------------------------------------------------------------------------
+
+
+def _victorialogs_url() -> str:
+    """Get VictoriaLogs base URL from env var or default."""
+    global _VICTORIALOGS_URL
+    if not _VICTORIALOGS_URL:
+        _VICTORIALOGS_URL = os.environ.get(
+            "NANOBOT_VICTORIALOGS_URL", "http://localhost:42010"
+        )
+    return _VICTORIALOGS_URL
+
+
+async def _logs_search(args: _LogsSearchQuery) -> list[TextContent]:
+    """Search logs using VictoriaLogs HTTP API."""
+    url = f"{_victorialogs_url()}/select/logsql/query"
+    params = {"query": args.query, "limit": args.limit}
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(url, params=params, timeout=10.0)
+            response.raise_for_status()
+            # VictoriaLogs returns newline-delimited JSON
+            lines = response.text.strip().split("\n")
+            logs = [json.loads(line) for line in lines if line.strip()]
+            return [TextContent(type="text", text=json.dumps(logs, indent=2, ensure_ascii=False))]
+        except httpx.HTTPError as exc:
+            return [TextContent(type="text", text=f"Error querying VictoriaLogs: {exc}")]
+        except json.JSONDecodeError as exc:
+            return [TextContent(type="text", text=f"Error parsing logs: {exc}")]
+
+
+async def _logs_error_count(args: _LogsErrorCountQuery) -> list[TextContent]:
+    """Count errors per service over a time window."""
+    # Build LogsQL query for errors
+    if args.service:
+        query = f'_stream:{{service.name="{args.service}"}} AND (level:error OR severity:error OR event:unhandled_exception)'
+    else:
+        query = "(level:error OR severity:error OR event:unhandled_exception)"
+
+    url = f"{_victorialogs_url()}/select/logsql/query"
+    params = {"query": query, "limit": 100}
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(url, params=params, timeout=10.0)
+            response.raise_for_status()
+            lines = response.text.strip().split("\n")
+            logs = [json.loads(line) for line in lines if line.strip()]
+
+            # Count errors by service
+            error_counts: dict[str, int] = {}
+            for log in logs:
+                service = log.get("service.name", log.get("service", "unknown"))
+                error_counts[service] = error_counts.get(service, 0) + 1
+
+            result = {
+                "query": query,
+                "time_window_hours": args.hours,
+                "total_errors": sum(error_counts.values()),
+                "by_service": error_counts,
+            }
+            return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
+        except httpx.HTTPError as exc:
+            return [TextContent(type="text", text=f"Error querying VictoriaLogs: {exc}")]
+        except json.JSONDecodeError as exc:
+            return [TextContent(type="text", text=f"Error parsing logs: {exc}")]
+
+
+# ---------------------------------------------------------------------------
 # Registry: tool name -> (input model, handler, Tool definition)
 # ---------------------------------------------------------------------------
 
@@ -185,6 +278,20 @@ _register(
     _sync_pipeline,
 )
 
+# Observability tools (VictoriaLogs)
+_register(
+    "logs_search",
+    "Search logs in VictoriaLogs using LogsQL. Use for debugging errors or finding specific events.",
+    _LogsSearchQuery,
+    _logs_search,
+)
+_register(
+    "logs_error_count",
+    "Count errors per service over a time window. Use to identify which services have issues.",
+    _LogsErrorCountQuery,
+    _logs_error_count,
+)
+
 
 # ---------------------------------------------------------------------------
 # MCP handlers
@@ -216,8 +323,12 @@ async def call_tool(name: str, arguments: dict[str, Any] | None) -> list[TextCon
 
 
 async def main(base_url: str | None = None) -> None:
-    global _base_url
+    """Initialize MCP server with LMS backend and VictoriaLogs URLs."""
+    global _base_url, _VICTORIALOGS_URL
     _base_url = base_url or os.environ.get("NANOBOT_LMS_BACKEND_URL", "")
+    _VICTORIALOGS_URL = os.environ.get(
+        "NANOBOT_VICTORIALOGS_URL", "http://localhost:42010"
+    )
     async with stdio_server() as (read_stream, write_stream):
         init_options = server.create_initialization_options()
         await server.run(read_stream, write_stream, init_options)
